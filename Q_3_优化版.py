@@ -1,0 +1,587 @@
+import numpy as np
+import pandas as pd
+import pulp
+import openpyxl
+
+sales_volume_fluctuation = {}   # 销售量波动
+yield_fluctuation = {}  # 亩产量波动
+cost_fluctuation = {}   # 成本波动
+price_fluctuation = {}  # 价格波动
+elasticity_coefficient_demand = {'粮食':0.25,'粮食（豆类）':0.25,'蔬菜':0.5,'蔬菜（豆类）':0.5,'食用菌':0.9} # 需求弹性系数
+crop_complementarity_coefficient = {'粮食':0.67,'蔬菜':0.4,'食用菌':0.2} # 与豆类的作物互补性系数
+crop_substitutability_coefficient = {'粮食':0.76,'粮食（豆类）':0.25,'蔬菜':0.55,'蔬菜（豆类）':0.35,'食用菌':0.6} # 同种类型作物之间替代性系数
+bean_crops = ['黄豆', '黑豆', '红豆', '绿豆', '爬豆', '豇豆', '刀豆', '芸豆']  # 豆类作物名称
+sheet_crops = pd.read_excel('datas/附件1.xlsx', sheet_name='乡村种植的农作物')
+sheet_crops['作物名称'] = sheet_crops['作物名称'].str.strip()  # 去空格
+sheet_crops['作物类型'] = sheet_crops['作物类型'].str.strip()  # 去空格
+
+# 获取作物类型
+def get_crop_type(crop_name):
+    crop_type = sheet_crops[(sheet_crops['作物名称'] == crop_name)]['作物类型'].values[0]
+    return crop_type
+#不确定性处理
+# 销售量变化率（相对2023）
+def generate_sales_volume_rate(season, crop_name, year):
+    power = year - 2023
+    sales_volume_fluctuation[(season, crop_name, year)] = 1
+    while power > 0:
+        power -= 1
+        if crop_name == '玉米' or crop_name == '小麦':   #玉米或小麦
+            growth_rate = np.random.uniform(0.05,0.1)
+        else:
+            growth_rate = np.random.uniform(-0.05, 0.05)
+        sales_volume_fluctuation[(season,crop_name,year)] *= (1 + growth_rate)
+    return sales_volume_fluctuation[(season,crop_name,year)]
+
+# 亩产量变化率
+def generate_yield_rate(season,crop_name,year):
+    power = year - 2023
+    yield_fluctuation[(season, crop_name, year)] = 1
+    while power > 0:
+        yield_fluctuation[(season,crop_name,year)] *= np.random.uniform(0.9, 1.1)
+        power -= 1
+    return yield_fluctuation[(season,crop_name,year)]
+
+# 种植成本变化率
+def generate_cost_rate(year):
+    cost_fluctuation[year] = 1 + 0.05*(year - 2023)
+    return cost_fluctuation[year]
+
+# 销售价格变化率
+def generate_price_rate(season,crop_name,year):
+    power = year - 2023
+    price_fluctuation[(season, crop_name, year)] = 1
+    crop_type = get_crop_type(crop_name)
+
+    if crop_type == '蔬菜' or crop_type == '蔬菜（豆类）':
+        price_fluctuation[(season, crop_name, year)] = ((1 + 0.05) ** power)
+    elif crop_name == '羊肚菌':
+        price_fluctuation[(season, crop_name, year)] = ((1 - 0.05) ** power)
+    elif crop_type == '食用菌':
+        while power > 0 :
+            price_fluctuation[(season, crop_name, year)] *= (1 - np.random.uniform(0.01, 0.05))
+            power -= 1
+    return price_fluctuation[(season, crop_name, year)]
+
+# 生成上述四个变化率
+def generate_all_rates(season,crop_name,year):
+    generate_sales_volume_rate(season, crop_name, year)
+    generate_yield_rate(season, crop_name, year)
+    generate_cost_rate(year)
+    generate_price_rate(season, crop_name, year)
+
+# 获取最终的销售量
+# 需要考虑本作物的价格波动，TODO:替代性
+def get_final_sales_volume(sales_volume_2023,season, crop_name, year):
+    final_sales_volume = sales_volume_fluctuation[(season, crop_name, year)] * sales_volume_2023
+    crop_type = get_crop_type(crop_name)
+    # 本作物价格波动影响
+    final_sales_volume *= (1 + price_fluctuation[(season, crop_name, year)]
+                           * elasticity_coefficient_demand[crop_type])
+    # 同种类型的其他作物价格波动影响（替代性）
+    for crop in sheet_crops[sheet_crops['作物类型'] == crop_type]['作物名称']:
+        if crop!= crop_name and price_fluctuation.get((season, crop, year)) is not None:
+            final_sales_volume *= (1 + price_fluctuation[(season, crop, year)]
+                                * crop_substitutability_coefficient[crop_type])
+
+    return final_sales_volume
+
+# 获取最终的亩产量
+# TODO: 考虑与豆类的互补性
+def get_final_yield(yield_2023, season, crop_name, year):
+    final_yield = yield_fluctuation[(season, crop_name, year)] * yield_2023
+    crop_type = get_crop_type(crop_name)
+    if crop_type == '粮食' or crop_type == '蔬菜' or crop_type == '食用菌':
+        for bean_name in bean_crops:
+            if yield_fluctuation.get((season, bean_name, year)) is not None:
+                final_yield *= (1 + crop_complementarity_coefficient[crop_type]
+                                * yield_fluctuation[(season, bean_name, year)])
+    return final_yield
+
+# 获取最终的种植成本
+def get_final_cost(cost_2023, year):
+    final_cost = cost_fluctuation[year] * cost_2023
+    return final_cost
+
+# 获取最终的销售价格
+def get_final_price(price_2023,season, crop_name, year):
+    final_price = price_fluctuation[(season, crop_name, year)] * price_2023
+    return final_price
+
+# 读取数据
+def read_data():
+    sheet1 = pd.read_excel('datas/附件2.xlsx', sheet_name='2023年统计的相关数据')  # 土地类型上的亩产量数据
+    sheet1 = sheet1.dropna(subset=['地块类型']) # 删除底部说明
+    sheet1['地块类型'] = sheet1['地块类型'].str.strip() # 去空格
+    sheet1['作物名称'] = sheet1['作物名称'].str.strip() # 去空格
+
+    # 补充智慧大棚第一季在sheet1中的数据
+    ordinary_greenhouse = sheet1[(sheet1['地块类型'] == '普通大棚') & (sheet1['种植季次'] == '第一季')]
+    smart_greenhouse = ordinary_greenhouse.copy()   # 创建省略的“智慧大棚”数据
+    smart_greenhouse['地块类型'] = '智慧大棚'
+    sheet1 = pd.concat([sheet1, smart_greenhouse], ignore_index=True)
+
+    sheet2 = pd.read_excel('datas/附件2.xlsx', sheet_name='2023年的农作物种植情况')
+    sheet2 = sheet2.fillna(method='ffill')
+    sheet2['作物名称'] = sheet2['作物名称'].str.strip() # 去空格
+
+    sheet3 = pd.read_excel('datas/附件1.xlsx', sheet_name='乡村的现有耕地')
+    sheet3['地块类型'] = sheet3['地块类型'].str.strip() # 去空格
+
+    # 将 sheet2 和 sheet3 合并，得到每个地块的土地类型
+    land_types = pd.merge(sheet2, sheet3, left_on='种植地块', right_on='地块名称')
+    land_types = land_types.drop(columns=['说明 ', '地块名称', '地块面积/亩', '作物编号'])
+    # print(land_types)
+    # 将合并后的数据与 sheet11 合并，得到每个作物在每种土地类型上的亩产量
+    sheet11 = sheet1.drop(columns=['序号', '作物编号'])
+    yield_data = pd.merge(land_types, sheet11, left_on=['地块类型', '作物名称','种植季次'], right_on=['地块类型', '作物名称','种植季次'])
+    # 计算每种作物的产量（种植面积 * 亩产量）
+    yield_data['该地块产量'] = yield_data['种植面积/亩'] * yield_data['亩产量/斤']
+
+    # 汇总每种作物在每一季度的总产量作为预测销售量
+    expected_sales_volume = yield_data.groupby(['种植季次', '作物名称'])['该地块产量'].sum().reset_index()
+    expected_sales_volume = expected_sales_volume.rename(columns={'该地块产量': '当季预期销售量'})
+    expected_sales_volume.to_excel('预期销售量（季节）.xlsx', index=False)
+    # print(expected_sales_volume)
+    return sheet1, sheet2, sheet3, expected_sales_volume
+
+# 销售单价处理函数，取平均值
+def convert_price_range_to_average(price_range):
+    try:
+        # 分离区间的两个数值
+        min_price, max_price = price_range.split('-')
+        # 将字符串转换为浮点数
+        min_price = float(min_price)
+        max_price = float(max_price)
+        # 计算平均数
+        return (min_price + max_price) / 2
+    except Exception as e:
+        # 如果出现任何错误，返回 NaN
+        print(f"Error processing {price_range}: {e}")
+        return float('nan')
+
+# 数据准备
+def prepare_data(sheet_yield_and_price_2023, sheet_crop_planting_2023):
+    # 数据处理
+    crops = sheet_crop_planting_2023[['作物名称', '作物类型']]
+    sheet_yield_and_price_2023['亩产量/斤'] = pd.to_numeric(sheet_yield_and_price_2023['亩产量/斤'], errors='coerce')
+    sheet_yield_and_price_2023['种植成本/(元/亩)'] = pd.to_numeric(sheet_yield_and_price_2023['种植成本/(元/亩)'], errors='coerce')
+    sheet_yield_and_price_2023['销售单价/(元/斤)'] = sheet_yield_and_price_2023['销售单价/(元/斤)'].apply(convert_price_range_to_average)
+    fields = sheet_yield_and_price_2023[['地块类型', '作物名称', '种植季次', '亩产量/斤', '种植成本/(元/亩)', '销售单价/(元/斤)']]
+    fields.to_excel('平均销售单价.xlsx', index=False)
+
+    #生成波动率
+    for year in range(2024,2031):
+        for crop_name in fields['作物名称'].unique():
+            for season in fields[fields['作物名称'] == crop_name]['种植季次'].unique():
+                generate_all_rates(season, crop_name, year)
+
+    return crops, fields
+
+# 创建单年模型
+def define_model(solved_decision_vars,sheet_crop_planting_2023,sheet_fields_name_and_area, fields, expected_sales_volume, year):
+    # 创建地块编号到地块类型的映射
+    field_type_mapping = sheet_fields_name_and_area.set_index('地块名称')['地块类型'].to_dict()
+    # 决策变量：地块上某种作物在某年某季度的种植面积
+    decision_vars = {}
+    for _, row in fields.iterrows():
+        field_type = row['地块类型']
+        crop_name = row['作物名称']
+        season = row['种植季次']
+        # 迭代所有地块编号，并检查是否匹配
+        for field_num, mapped_field_type in field_type_mapping.items():
+            if mapped_field_type == field_type:
+                    decision_vars[(field_num, field_type, crop_name, season, year)] = pulp.LpVariable(
+                        f"area_{field_num}_{field_type}_{crop_name}_{season}_{year}",
+                        lowBound=0, cat='Continuous'
+                    )
+
+    model = pulp.LpProblem(f"Maximize_Revenue_{year}", pulp.LpMaximize)
+
+    # 目标函数：最大化该年的收益
+    # 某种作物在一个种植季次的产量和
+    total_production = {}  # 分季总产量
+    for crop_name in fields['作物名称'].unique():
+        for season in fields[fields['作物名称'] == crop_name]['种植季次'].unique():
+                total_production[(crop_name, season, year)] = pulp.lpSum(
+                    decision_vars.get((field_num, field_type, crop_name, season, year), 0)
+                        * get_final_yield(fields[(fields['地块类型'] == field_type) &
+                                (fields['作物名称'] == crop_name) &
+                                (fields['种植季次'] == season)]['亩产量/斤'].values[0],season,crop_name,year)
+                    for field_type in fields[(fields['作物名称']==crop_name) & (fields['种植季次'] == season)]['地块类型']
+                    for field_num,field_type_value in field_type_mapping.items()
+                    if field_type_mapping.get(field_num) == field_type
+                ) # 种植面积 * 亩产量
+
+    # 总种植成本
+    total_cost = pulp.lpSum([
+        decision_vars[(field_num, row['地块类型'], row['作物名称'], row['种植季次'], year)]
+        * get_final_cost(row['种植成本/(元/亩)'],year)
+        for _, row in fields.iterrows()
+        for field_num, mapped_field_type in field_type_mapping.items()
+        if mapped_field_type == row['地块类型']
+    ]) # 种植面积 * 单位成本
+
+    # 决策变量：超出预期销售量与未超出的部分
+    under_exp_sv = {}
+    beyond_exp_sv = {}
+    for crop_name in fields['作物名称'].unique():
+        for season in fields[fields['作物名称'] == crop_name]['种植季次'].unique():
+            # 创建新的决策变量
+            under_exp_sv[(crop_name,season)] = pulp.LpVariable(f'under_exp_sv_{crop_name}_{season}', lowBound=0, cat='Continuous')
+            beyond_exp_sv[(crop_name,season)] = pulp.LpVariable(f'beyond_exp_sv_{crop_name}_{season}', lowBound=0, cat='Continuous')
+            exp_sv = get_final_sales_volume(expected_sales_volume[
+                                                (expected_sales_volume['种植季次'] == season)
+                                                &(expected_sales_volume['作物名称'] == crop_name)]['当季预期销售量'].values[0],
+                                            season,crop_name,year)
+
+            # 添加约束，以满足超出/未超出的定义
+            model += under_exp_sv[(crop_name,season)] + beyond_exp_sv[(crop_name,season)] == total_production[(crop_name, season, year)]
+            model += under_exp_sv[(crop_name,season)] <= exp_sv
+            model += beyond_exp_sv[(crop_name,season)] >= 0
+
+    # 总销售收益
+    # 超过预期销售量的部分无法售出
+    total_revenue = pulp.lpSum([
+        (under_exp_sv[(crop_name, season)] +
+         beyond_exp_sv[(crop_name, season)] * 0.5)
+        * get_final_price(fields[
+            (fields['种植季次'] == season) &
+            (fields['作物名称'] == crop_name)
+            ]['销售单价/(元/斤)'].values[0],season,crop_name,year)
+        for crop_name in fields['作物名称'].unique()
+        for season in fields[fields['作物名称'] == crop_name]['种植季次']
+    ]) - total_cost     # 销售额 - 总成本
+
+    model += total_revenue, f"Total_Revenue_{year}"     # 设置总销售利润为目标函数
+
+    # 约束条件
+    # 1. 每种作物在同一地块（含大棚）都不能连续重茬种植
+    # 1.1 同一年的第一季、第二季。仅限于智慧大棚中全部作物。
+    smart_greenhouse_field_nums = sheet_fields_name_and_area[sheet_fields_name_and_area['地块类型'] == '智慧大棚']['地块名称']
+    for field_num in smart_greenhouse_field_nums:
+        for crop_name in fields[fields['地块类型'] == '智慧大棚']['作物名称'].unique():
+            area_first_season = decision_vars.get((field_num, '智慧大棚', crop_name, '第一季', year), 0)
+            area_second_season = decision_vars.get((field_num, '智慧大棚', crop_name, '第二季', year), 0)
+            # 添加约束：保证至少有一个季节的种植面积为0
+            model += (area_first_season == 0 or area_second_season == 0)
+
+    # 1.2 单季作物的连续两年。仅限单季作物
+    for field_type in ['平旱地', '梯田', '山坡地', '水浇地']:
+        field_nums = sheet_fields_name_and_area[sheet_fields_name_and_area['地块类型'] == field_type]['地块名称']
+        for field_num in field_nums:
+            for crop_name in fields[(fields['地块类型'] == field_type) & (fields['种植季次'] == '单季')]['作物名称'].unique():
+                if year == 2024:
+                    area_this_year = decision_vars.get((field_num, field_type, crop_name, '单季', year), 0)  # 本年度的种植面积
+                    filtered_data = sheet_crop_planting_2023[
+                        (sheet_crop_planting_2023['作物名称'] == crop_name) &
+                        (sheet_crop_planting_2023['种植地块'] == field_num)
+                        ]['种植面积/亩']     # 2023年对应地块对应作物的种植面积
+
+                    if not filtered_data.empty:
+                        model += (area_this_year == 0)
+                else:
+                    area_last_year = solved_decision_vars.get(f"area_{field_num}_{field_type}_{crop_name}_单季_{year - 1}")
+                    if area_last_year is not None and area_last_year > 0:   # 若上一年有种植
+                        area_this_year = decision_vars.get((field_num, field_type, crop_name, '单季', year), 0)
+                        model += (area_this_year == 0)  # 则添加约束：本年度无法种植
+
+    # 1.3 上一年的第二季与下一年的第一季不能连续种植。仅需考虑智慧大棚中的作物
+    for field_num in smart_greenhouse_field_nums:
+        for crop_name in fields[fields['地块类型'] == '智慧大棚']['作物名称'].unique():
+            if year == 2024:
+                area_this_first_season = decision_vars.get((field_num, '智慧大棚', crop_name, '第一季', year), 0)
+                # 查找2023年对应地块对应作物的种植量
+                filtered_data = sheet_crop_planting_2023[
+                    (sheet_crop_planting_2023['作物名称'] == crop_name) &
+                    (sheet_crop_planting_2023['种植地块'] == field_num)
+                    ]['种植面积/亩']
+
+                if not filtered_data.empty:
+                    model += (area_this_first_season == 0)
+
+            else:
+                area_last_second_season = solved_decision_vars.get(f"area_{field_num}_智慧大棚_{crop_name}_第二季_{year - 1}")
+                if area_last_second_season is not None and area_last_second_season > 0:
+                    area_this_first_season = decision_vars.get((field_num, '智慧大棚', crop_name, '第一季', year), 0)
+                    model += (area_this_first_season == 0)
+
+
+    # 2. 每个地块（含大棚）的所有土地三年内至少种植一次豆类作物
+    if year != 2024:
+        for field_type in['平旱地', '梯田', '山坡地', '水浇地','普通大棚','智慧大棚']:
+                field_nums = sheet_fields_name_and_area[sheet_fields_name_and_area['地块类型'] == field_type]['地块名称']
+                for field_num in field_nums:
+                    # 前两年该地块上的豆类产量
+                    bean_volume_in_last_2year = 0
+                    if year == 2025:
+                        for crop_name in bean_crops:
+                            for season in fields[fields['作物名称'] == crop_name]['种植季次'].unique():
+                                if solved_decision_vars.get(
+                                        f"area_{field_num}_{field_type}_{crop_name}_{season}_{year - 1}") is not None:
+                                    bean_volume_in_last_2year += solved_decision_vars.get(f"area_{field_num}_{field_type}_{crop_name}_{season}_{year - 1}")
+
+                                filtered_data = sheet_crop_planting_2023[
+                                    (sheet_crop_planting_2023['作物名称'] == crop_name) &
+                                    (sheet_crop_planting_2023['种植地块'] == field_num)
+                                    ]['种植面积/亩']
+                                if not filtered_data.empty:
+                                    bean_volume_in_last_2year += filtered_data.values[0]
+
+                    elif year > 2025:
+                        for crop_name in bean_crops:
+                            for season in fields[fields['作物名称'] == crop_name]['种植季次'].unique():
+                                if solved_decision_vars.get(
+                                        f"area_{field_num}_{field_type}_{crop_name}_{season}_{year - 1}") is not None:
+                                    bean_volume_in_last_2year += solved_decision_vars.get(f"area_{field_num}_{field_type}_{crop_name}_{season}_{year - 1}")
+                                if solved_decision_vars.get(
+                                        f"area_{field_num}_{field_type}_{crop_name}_{season}_{year - 2}") is not None:
+                                    bean_volume_in_last_2year += solved_decision_vars.get(f"area_{field_num}_{field_type}_{crop_name}_{season}_{year - 2}")
+                    if bean_volume_in_last_2year == 0:
+                        model += pulp.lpSum([
+                            decision_vars.get((field_num,field_type, crop_name, season ,year), 0)
+                            for crop_name in bean_crops
+                            for season in fields[fields['作物名称'] == crop_name]['种植季次'].unique()
+                        ]) >= 0.06
+
+    # 4. 某地块某季节的种植总面积小于该地块面积
+    for season in ['第一季', '第二季','单季']:
+        for field_type in fields['地块类型'].unique():
+            field_nums = sheet_fields_name_and_area[sheet_fields_name_and_area['地块类型'] == field_type]['地块名称']
+            for field_num in field_nums:
+                    area_of_this_fields = sheet_fields_name_and_area[sheet_fields_name_and_area['地块名称']==field_num]['地块面积/亩']
+                    model += (pulp.lpSum([
+                                decision_vars.get((field_num, field_type, crop_name, season, year), 0)
+                                for crop_name in fields[fields['地块类型'] == field_type]['作物名称'].unique()
+                            ]) <= area_of_this_fields)
+
+    # 5. 水浇地单季（只有水稻）与双季不能共存
+    field_nums = sheet_fields_name_and_area[sheet_fields_name_and_area['地块类型'] == '水浇地']['地块名称']
+    for field_num in field_nums:
+        sjd_single_area = decision_vars.get((field_num, '水浇地', '水稻', '单季', year), 0)
+        for crop_name in fields[(fields['地块类型'] == '水浇地')&(fields['种植季次'] != '单季')]['作物名称'].unique():
+            sjd_first_area = decision_vars.get((field_num,'水浇地', crop_name, '第一季', year),0)
+            sjd_second_area = decision_vars.get((field_num,'水浇地', crop_name, '第二季', year),0)
+            model += (sjd_single_area == 0 or (sjd_first_area == 0 and sjd_second_area == 0))
+
+    return model, decision_vars
+
+
+# 求解模型
+def solve_model(model):
+    model.solve()
+    return model
+
+# 保存结果到Excel
+def save_results(decision_vars,results,year):
+    for var in decision_vars.values():
+        results.append({
+            '地块名称': var.name.split('_')[1],
+            '地块类型': var.name.split('_')[2],
+            '作物名称': var.name.split('_')[3],
+            '季次': var.name.split('_')[4],
+            '年份': var.name.split('_')[5],
+            '种植面积': var.varValue
+        })
+    if year == 2030:
+        result_df = pd.DataFrame(results)
+        result_df.to_excel("my_result3.xlsx", index=False)
+
+def process_file(my_result_file, cache_files, attachment_file):
+    # 解包 cache_files
+    cache_file_blank, cache_file_final = cache_files
+
+    # Part 1: 读取 my_result.xlsx 文件并更新缓存文件
+    # 读取 my_result.xlsx 文件
+    my_result_df = pd.read_excel(my_result_file)
+
+    # 替换季次中的"单季"为"第一季"
+    my_result_df['季次'] = my_result_df['季次'].replace('单季', '第一季')
+
+    # 打开缓存文件中的所有 sheet
+    xls = pd.ExcelFile(cache_file_blank)
+    years_sheets = {sheet_name: pd.read_excel(xls, sheet_name=sheet_name) for sheet_name in xls.sheet_names}
+
+    # 作物列的对应关系
+    crop_columns = {
+        '黄豆': '黄豆', '黑豆': '黑豆', '红豆': '红豆', '绿豆': '绿豆', '爬豆': '爬豆',
+        '小麦': '小麦', '玉米': '玉米', '谷子': '谷子', '高粱': '高粱', '黍子': '黍子',
+        '荞麦': '荞麦', '南瓜': '南瓜', '红薯': '红薯', '莜麦': '莜麦', '大麦': '大麦',
+        '水稻': '水稻', '豇豆': '豇豆', '刀豆': '刀豆', '芸豆': '芸豆', '土豆': '土豆',
+        '西红柿': '西红柿', '茄子': '茄子', '菠菜': '菠菜', '青椒': '青椒', '菜花': '菜花',
+        '包菜': '包菜', '油麦菜': '油麦菜', '小青菜': '小青菜', '黄瓜': '黄瓜', '生菜': '生菜',
+        '辣椒': '辣椒', '空心菜': '空心菜', '黄心菜': '黄心菜', '芹菜': '芹菜', '大白菜': '大白菜',
+        '白萝卜': '白萝卜', '红萝卜': '红萝卜', '榆黄菇': '榆黄菇', '香菇': '香菇', '白灵菇': '白灵菇',
+        '羊肚菌': '羊肚菌'
+    }
+
+    # 遍历 my_result.xlsx 中的数据并将其写入到缓存文件
+    for index, row in my_result_df.iterrows():
+        field = row['地块名称']
+        crop = row['作物名称']
+        season = row['季次']
+        year = row['年份']
+        area = row['种植面积']
+
+        # 1. 找年份对应的 sheet
+        sheet_name = str(year)
+        if sheet_name in years_sheets:
+            sheet_df = years_sheets[sheet_name]
+
+            # 2. 找到对应的季次 ("第一季" 或 "第二季")
+            season_rows = sheet_df[sheet_df['季次'] == season]
+            if season_rows.empty:
+                print(f"Season '{season}' not found in sheet {sheet_name}")
+                continue
+
+            # 3. 找到对应的地块
+            field_row = season_rows[season_rows['地块名'] == field]
+            if field_row.empty:
+                print(f"Field '{field}' not found in season '{season}' in sheet {sheet_name}")
+                continue
+
+            # 获取地块所在的行索引
+            field_row_idx = field_row.index[0]
+
+            # 4. 找到作物列
+            if crop in crop_columns:
+                crop_col = crop_columns[crop]
+            else:
+                print(f"Crop '{crop}' not found in crop_columns")
+                continue
+
+            # 确保作物列存在
+            if crop_col not in sheet_df.columns:
+                print(f"Crop column '{crop_col}' not found in sheet '{sheet_name}'")
+                continue
+
+            # 5. 写入种植面积数据
+            if pd.isna(sheet_df.at[field_row_idx, crop_col]):  # 如果当前单元格为空
+                sheet_df.at[field_row_idx, crop_col] = area
+
+    # 保存更新后的缓存文件为新的文件
+    with pd.ExcelWriter(cache_file_final, engine='openpyxl', mode='w') as writer:
+        for sheet_name, df in years_sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    print(f"Data update complete in {cache_file_final}.")
+
+    # Part 2: 将缓存文件中的数据粘贴到 附件文件中
+
+    # 打开缓存文件
+    a_workbook = openpyxl.load_workbook(cache_file_final)
+
+    # 打开附件文件
+    b_workbook = openpyxl.load_workbook(attachment_file)
+
+    # 遍历缓存文件和附件文件的所有 sheet
+    for sheet_name in a_workbook.sheetnames:
+        # 取出缓存文件和附件文件中对应的 sheet
+        a_sheet = a_workbook[sheet_name]
+        b_sheet = b_workbook[sheet_name]
+
+        # 提取缓存文件 C2 到 AQ83 的数据
+        for row_idx in range(2, 84):  # 行范围从 2 到 83
+            for col_idx in range(3, 44):  # 列范围从 C (3) 到 AQ (43)
+                # 获取缓存文件中的数据
+                a_value = a_sheet.cell(row=row_idx, column=col_idx).value
+
+                # 将数据粘贴到附件文件相应单元格中，保持原有格式
+                b_sheet.cell(row=row_idx, column=col_idx).value = a_value
+
+    # 保存修改后的附件文件，保留原有格式和合并单元格
+    b_workbook.save(attachment_file)
+
+    print(
+        f"Data successfully copied from {cache_file_final} to {attachment_file}, preserving all formatting and merged cells.")
+
+# 添加实验次数逻辑
+def main():
+    sheet_yield_and_price_2023, sheet_crop_planting_2023, sheet_fields_name_and_area, expected_sales_volume = read_data()
+    crops, fields = prepare_data(sheet_yield_and_price_2023, sheet_crop_planting_2023)
+    expected_sales_volume_1 = pd.read_excel('datas/预期每季销售量（补充版）.xlsx')
+    expected_sales_volume_1['作物名称'] = expected_sales_volume_1['作物名称'].str.strip()  # 去空格
+
+    num_experiments = 500  # 设置实验次数
+    best_revenue = float('-inf')  # 保存最佳实验的总收益
+    best_results = None  # 保存最佳实验的结果
+    best_yearly_profits = []  # 保存最佳实验的每年利润
+    best_experiment_number = -1  # 保存最佳实验编号
+    all_experiments_results = []  # 用于存储所有实验的每年利润和总利润
+
+    for experiment in range(num_experiments):
+        print(f"Running experiment {experiment + 1}/{num_experiments}...")
+
+        models = {}
+        solved_decision_vars = {}  # 已求解的决策变量
+        results = []
+        total_revenue_experiment = 0  # 用于记录当前实验的总收益
+        yearly_profits = []  # 用于记录每年的利润
+
+        # 对每一年进行模型求解
+        for year in range(2024, 2031):
+            model, decision_vars = define_model(solved_decision_vars, sheet_crop_planting_2023,
+                                                sheet_fields_name_and_area, fields, expected_sales_volume_1, year)
+            models[year] = solve_model(model)  # 求解模型
+            save_results(decision_vars, results, year)
+
+            # 保存每年结果
+            for key, var in decision_vars.items():
+                field_num, field_type, crop_name, season, _ = key
+                var_name = f"area_{field_num}_{field_type}_{crop_name}_{season}_{year}"
+                solved_decision_vars[var_name] = pulp.value(var)
+
+            # 输出当年的利润并累加
+            objective_value = pulp.value(models[year].objective)
+            print(f"{year}年利润: {objective_value}")
+            total_revenue_experiment += objective_value
+            yearly_profits.append(objective_value)  # 保存每年的利润
+
+        # 将实验结果存储到 all_experiments_results 中
+        all_experiments_results.append({
+            '实验编号': experiment + 1,
+            '每年利润': yearly_profits,
+            '总利润': total_revenue_experiment
+        })
+
+        # 比较并记录最佳方案
+        if total_revenue_experiment > best_revenue:
+            print(f"New best result found in experiment {experiment + 1} with total revenue: {total_revenue_experiment}")
+            best_revenue = total_revenue_experiment
+            best_results = results.copy()  # 保存最优结果
+            best_yearly_profits = yearly_profits.copy()  # 保存每年的利润
+            best_experiment_number = experiment + 1  # 记录最佳模拟的次数
+        else:
+            print(f"Experiment {experiment + 1} did not exceed the best revenue: {best_revenue}")
+
+    # 输出最佳方案的总收益、最佳模拟次数及每年的利润
+    print(f"最佳方案的总收益为: {best_revenue}")
+    print(f"最佳模拟次数: {best_experiment_number}")
+    print(f"最佳每年的利润: {best_yearly_profits}")
+
+    # 保存每次实验的每年利润和总利润到 Excel 文件
+    experiment_data = []
+    for experiment_result in all_experiments_results:
+        experiment_num = experiment_result['实验编号']
+        yearly_profits = experiment_result['每年利润']
+        total_revenue = experiment_result['总利润']
+        experiment_data.append([experiment_num] + yearly_profits + [total_revenue])
+
+    columns = ['实验编号'] + [f"{year}年利润" for year in range(2024, 2031)] + ['总利润']
+    df_experiments = pd.DataFrame(experiment_data, columns=columns)
+    df_experiments.to_excel('Q3_experiments_results.xlsx', index=False)
+    print("All experiment results saved to Q3_experiments_results.xlsx.")
+
+    # 保存最佳结果到Excel文件
+    if best_results:
+        result_df = pd.DataFrame(best_results)
+        result_df.to_excel("best_result_Q3.xlsx", index=False)
+        print(f"Best result saved to best_result_Q3.xlsx")
+
+    # 处理文件
+    process_file('best_result_Q3.xlsx', ('datas/缓存-result3（空白）.xlsx', 'datas/缓存-result3.xlsx'),
+                 'datas/附件3-result3.xlsx')
+
+
+if __name__ == "__main__":
+    main()
